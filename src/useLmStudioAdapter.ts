@@ -1,38 +1,15 @@
 import { useAsStreamAdapter } from '@nlux/react';
 import type { StreamingAdapterObserver, ChatAdapterExtras } from '@nlux/core';
+import type { 
+  LmStudioAdapterOptions, 
+  GenerationSettings,
+  ChatMessage
+} from './types.ts';
 
-interface MessageMetadata {
-  responseTime?: number;
-  tokens?: number;
-  model?: string;
-  timestamp?: number;
-}
-
-interface GenerationSettings {
-  temperature: number;
-  maxTokens: number;
-  // Top P удален для упрощения интерфейса
-}
-
-interface AttachedText {
-  name: string;
-  content: string;
-}
-
-interface LmStudioAdapterOptions {
-  modelName: string;
-  history?: Array<{ role: string; message: string }>;
-  systemPrompt?: string;
-  generationSettings?: GenerationSettings;
-  abortControllerRef?: React.MutableRefObject<AbortController | null>;
-  onMessageSent?: (message: string) => void;
-  onMessageReceived?: (message: string, metadata?: MessageMetadata) => void;
-  attachedImages?: string[];
-  attachedTexts?: AttachedText[];
-}
-
+/**
+ * Кастомный хук-адаптер для подключения к локальному серверу LM Studio.
+ */
 export const useLmStudioAdapter = (options: LmStudioAdapterOptions | string) => {
-  // Безопасная деструктуризация с дефолтными значениями
   const modelName = typeof options === 'string' ? options : options.modelName;
   const history = typeof options === 'object' ? (options.history || []) : [];
   const systemPrompt = typeof options === 'object' ? (options.systemPrompt || 'Ты полезный ИИ-ассистент.') : 'Ты полезный ИИ-ассистент.';
@@ -50,67 +27,40 @@ export const useLmStudioAdapter = (options: LmStudioAdapterOptions | string) => 
       const startTime = Date.now();
       
       try {
-        if (onMessageSent) {
-          onMessageSent(message);
-        }
+        if (onMessageSent) onMessageSent(message);
 
-        const messages: any[] = [
-          { role: 'system', content: systemPrompt }
-        ];
-
-        history.forEach((msg) => {
-          messages.push({
-            role: msg.role === 'user' ? 'user' : 'assistant',
-            content: msg.message
-          });
+        const messages: any[] = [{ role: 'system', content: systemPrompt }];
+        history.forEach((msg: ChatMessage) => {
+          messages.push({ role: msg.role === 'user' ? 'user' : 'assistant', content: msg.message });
         });
         
         const hasAttachments = attachedImages.length > 0 || attachedTexts.length > 0;
-        
         if (hasAttachments) {
           const content: any[] = [];
-          
-          attachedTexts.forEach(txt => {
-            content.push({
-              type: 'text',
-              text: `📄 Файл "${txt.name}":\n\`\`\`\n${txt.content}\n\`\`\``
-            });
-          });
-          
-          attachedImages.forEach(img => {
-            content.push({
-              type: 'image_url',
-              image_url: { url: img }
-            });
-          });
-          
-          if (message.trim()) {
-            content.push({ type: 'text', text: message });
-          }
-          
+          attachedTexts.forEach((txt: { name: string; content: string }) => 
+            content.push({ type: 'text', text: `📄 Файл "${txt.name}":\n\`\`\`\n${txt.content}\n\`\`\`` })
+          );
+          attachedImages.forEach((img: string) => 
+            content.push({ type: 'image_url', image_url: { url: img } })
+          );
+          if (message.trim()) content.push({ type: 'text', text: message });
           messages.push({ role: 'user', content });
         } else {
           messages.push({ role: 'user', content: message });
         }
 
         const controller = new AbortController();
-        if (abortControllerRef) {
-          abortControllerRef.current = controller;
-        }
+        if (abortControllerRef) abortControllerRef.current = controller;
 
         const response = await fetch('http://localhost:1234/v1/chat/completions', {
           method: 'POST',
-          headers: { 
-            'Content-Type': 'application/json',
-            'Accept': 'text/event-stream'
-          },
-          body: JSON.stringify({
-            model: modelName,
-            messages,
-            stream: true,
-            temperature: generationSettings.temperature,
-            max_tokens: generationSettings.maxTokens,
-            // top_p намеренно опущен, модель использует значение по умолчанию (1.0)
+          headers: { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' },
+          body: JSON.stringify({ 
+            model: modelName, 
+            messages, 
+            stream: true, 
+            temperature: generationSettings.temperature, 
+            max_tokens: generationSettings.maxTokens 
           }),
           signal: controller.signal,
         });
@@ -120,39 +70,26 @@ export const useLmStudioAdapter = (options: LmStudioAdapterOptions | string) => 
           throw new Error(`LM Studio error ${response.status}: ${errorText}`);
         }
 
-        if (!response.body) {
-          throw new Error('Response body is null');
-        }
-
-        const reader = response.body.getReader();
+        const reader = response.body!.getReader();
         const decoder = new TextDecoder();
         let fullResponse = '';
         let usageTokens: number | undefined;
 
         while (true) {
           const { done, value } = await reader.read();
-          
           if (done) break;
           
           const chunk = decoder.decode(value, { stream: true });
-          const lines = chunk.split('\n');
-          
-          for (const line of lines) {
+          for (const line of chunk.split('\n')) {
             const trimmedLine = line.trim();
             if (trimmedLine.startsWith('data: ')) {
               const data = trimmedLine.slice(6).trim();
-              
               if (data === '[DONE]') break;
-              
               if (data) {
                 try {
                   const parsed = JSON.parse(data);
                   const content = parsed.choices?.[0]?.delta?.content;
-                  
-                  if (parsed.usage) {
-                    usageTokens = parsed.usage.completion_tokens || parsed.usage.total_tokens;
-                  }
-                  
+                  if (parsed.usage) usageTokens = parsed.usage.completion_tokens || parsed.usage.total_tokens;
                   if (content) {
                     fullResponse += content;
                     observer.next(content);
@@ -168,15 +105,10 @@ export const useLmStudioAdapter = (options: LmStudioAdapterOptions | string) => 
         observer.complete();
         
         const responseTime = Date.now() - startTime;
-        const tokens = usageTokens || Math.ceil(fullResponse.length / 4);
+        const tokens = usageTokens ?? Math.ceil(fullResponse.length / 4);
         
         if (onMessageReceived && fullResponse) {
-          onMessageReceived(fullResponse, {
-            responseTime,
-            tokens,
-            model: modelName,
-            timestamp: Date.now()
-          });
+          onMessageReceived(fullResponse, { responseTime, tokens, model: modelName, timestamp: Date.now() });
         }
       } catch (error: any) {
         if (error.name === 'AbortError' || error.message?.includes('aborted')) {
@@ -185,17 +117,15 @@ export const useLmStudioAdapter = (options: LmStudioAdapterOptions | string) => 
         }
         
         const errorMessage = error instanceof Error ? error.message : 'Неизвестная ошибка';
-        
+
         if (errorMessage.includes('fetch') || errorMessage.includes('Failed to fetch')) {
-          observer.next('⚠️ **Ошибка подключения:** LM Studio не запущен.');
+          observer.next('️ **Ошибка подключения:** LM Studio не запущен или недоступен.');
         } else if (errorMessage.includes('404')) {
           observer.next(`⚠️ **Модель не найдена:** "${modelName}"`);
         } else {
           observer.next(`⚠️ **Ошибка:** ${errorMessage}`);
         }
-        
-        observer.error(error as Error);
-        observer.complete();
+        observer.complete(); 
       }
     }
   );
